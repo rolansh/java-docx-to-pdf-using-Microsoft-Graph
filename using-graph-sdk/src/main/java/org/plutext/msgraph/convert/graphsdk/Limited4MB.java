@@ -18,16 +18,31 @@
 
 package org.plutext.msgraph.convert.graphsdk;
 
+import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URL;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Stream;
 
+import com.azure.core.http.rest.RequestOptions;
 import com.azure.identity.ClientSecretCredential;
 import com.azure.identity.ClientSecretCredentialBuilder;
+import com.microsoft.graph.authentication.TokenCredentialAuthProvider;
+import com.microsoft.graph.logger.LoggerLevel;
 import com.microsoft.graph.models.DriveItem;
-import com.microsoft.graph.serviceclient.GraphServiceClient;
+import com.microsoft.graph.models.DriveItemCreateUploadSessionParameterSet;
+import com.microsoft.graph.models.DriveItemUploadableProperties;
+import com.microsoft.graph.options.Option;
+import com.microsoft.graph.requests.DriveCollectionPage;
+import com.microsoft.graph.requests.DriveCollectionRequestBuilder;
+import com.microsoft.graph.requests.DriveItemContentStreamRequestBuilder;
+import com.microsoft.graph.requests.DriveItemCreateUploadSessionRequest;
+import com.microsoft.graph.requests.DriveItemRequest;
+import com.microsoft.graph.requests.GraphServiceClient;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
 import org.plutext.msgraph.convert.AbstractOpenXmlToPDF;
@@ -55,45 +70,80 @@ public class Limited4MB extends AbstractOpenXmlToPDF {
 			
 	@Override
 	public byte[] convert(byte[] bytes, String ext) throws ConversionException {
-		// The client credentials flow requires that you request the
-		// /.default scope, and pre-configure your permissions on the
-		// app registration in Azure. An administrator must grant consent
-		// to those permissions beforehand.
-		final String[] scopes = new String[] { "https://graph.microsoft.com/.default" };
-
 		// Authentication provider - Client credentials provider - Using a client secret
 		// https://learn.microsoft.com/en-us/graph/sdks/choose-authentication-providers?tabs=java
-		final ClientSecretCredential credential = new ClientSecretCredentialBuilder()
+		final ClientSecretCredential clientCreds = new ClientSecretCredentialBuilder()
 				.clientId(authConfig.apiKey())
-				.tenantId(authConfig.tenant())
 				.clientSecret(authConfig.apiSecret())
+				.tenantId(authConfig.tenant())
 				.build();
 
-		final GraphServiceClient graphClient = new GraphServiceClient(credential, scopes);
+		final TokenCredentialAuthProvider authProvider = new TokenCredentialAuthProvider(clientCreds);
+
+		final GraphServiceClient graphClient = GraphServiceClient
+				.builder()
+				.authenticationProvider(authProvider)
+				.buildClient();
 		
         String tmpFileName = UUID.randomUUID().toString() + ".docx"; // an extension is required
-		String itemPath =  "root:/" + tmpFileName +":";
+//		String itemPath =  "root:/" + tmpFileName +":";
 
-		// Determined the driveId
-		String driveId = graphClient.sites().bySiteId(authConfig.site()).drive().get().getId();
+		final DriveItemCreateUploadSessionParameterSet uploadParams = DriveItemCreateUploadSessionParameterSet
+				.newBuilder()
+				.withItem(new DriveItemUploadableProperties())
+				.build();
 
 		// Upload
-		DriveItem driveItem = graphClient.drives()
-				.byDriveId(driveId)
+		DriveItem driveItem = graphClient
+				.sites()
+				.byId(authConfig.site())
+				.drive()
 				.items()
-				.byDriveItemId(itemPath)
+				.byId("root")
+				.itemWithPath(tmpFileName)
 				.content()
-				.put(new ByteArrayInputStream(bytes));
+				.buildRequest()
+				.put(bytes);
 
+		log.debug("............... {}, {}, {}, {}", driveItem.id, driveItem.webUrl, driveItem.webDavUrl, driveItem.folder);
 		// Download as pdf
-		InputStream inputStream = graphClient.drives().byDriveId(driveId).items().byDriveItemId(itemPath).content().get(requestConfiguration -> {
-			requestConfiguration.queryParameters.format = "pdf";
-		});
+//		String customPdfUrlStr = graphClient.sites(authConfig.site()).drive().items("root:/" + tmpFileName + ":")
+//				.buildRequest().getRequestUrl().toString()
+//				;
+//				+ "/content?format=pdf";
 
+
+		graphClient.getLogger().setLoggingLevel(LoggerLevel.DEBUG);
+		String customPdfUrlStr = "/sites/" + authConfig.site() + "/drive/items/root:/" + tmpFileName + ":" + "/content?format=pdf";
+
+		BufferedInputStream inputStream = (BufferedInputStream)graphClient.customRequest(customPdfUrlStr, Stream.class)
+				.buildRequest()
+				.get();
+
+
+
+		// Method 2
+		DriveItemContentStreamRequestBuilder pdfRequestBuilder = graphClient
+				.sites()
+				.byId(authConfig.site())
+				.drive()
+				.items()
+				.byId("root")
+				.itemWithPath(tmpFileName)
+				.content();
+
+		String pdfUrlStr = pdfRequestBuilder
+				.buildRequest()
+				.getRequestUrl()
+				.toString() + "?format=pdf";
+
+		// TODO: How to request the full path url?
 
 		try {
 			// Move to trash
-			graphClient.drives().byDriveId(driveId).items().byDriveItemId(itemPath).delete();
+			graphClient.sites(authConfig.site()).drive().items("root:/" + tmpFileName + ":")
+					.buildRequest().delete();
+
 			return IOUtils.toByteArray(inputStream);
 		} catch (Exception e) {
 			throw new ConversionException(e.getMessage(), e);

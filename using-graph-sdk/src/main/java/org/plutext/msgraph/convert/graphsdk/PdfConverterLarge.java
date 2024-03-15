@@ -24,37 +24,43 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
-import java.util.ArrayList;
-import java.util.List;
+import java.net.URL;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.FutureTask;
 import java.util.stream.Stream;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonPrimitive;
+import com.microsoft.graph.http.GraphServiceException;
+import com.microsoft.graph.models.DriveItemCreateUploadSessionParameterSet;
+import com.microsoft.graph.models.Request;
+import com.microsoft.graph.requests.DriveItemContentStreamRequestBuilder;
+import com.microsoft.graph.requests.DriveItemCreateUploadSessionRequest;
+import com.microsoft.graph.requests.GraphServiceClient;
+import com.microsoft.graph.tasks.IProgressCallback;
+import com.microsoft.graph.tasks.LargeFileUploadResult;
+import com.microsoft.graph.tasks.LargeFileUploadTask;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
 import org.plutext.msgraph.convert.AbstractOpenXmlToPDF;
 import org.plutext.msgraph.convert.AuthConfig;
 import org.plutext.msgraph.convert.ConversionException;
-import org.plutext.msgraph.convert.DocxToPdfConverter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.azure.identity.ClientCertificateCredential;
-import com.azure.identity.ClientCertificateCredentialBuilder;
 import com.azure.identity.ClientSecretCredential;
 import com.azure.identity.ClientSecretCredentialBuilder;
-import com.microsoft.graph.core.exceptions.ClientException;
-import com.microsoft.graph.core.models.IProgressCallback;
-import com.microsoft.graph.core.models.UploadResult;
-import com.microsoft.graph.core.tasks.LargeFileUploadTask;
-import com.microsoft.graph.drives.item.items.item.createuploadsession.CreateUploadSessionPostRequestBody;
-import com.microsoft.graph.models.Drive;
 import com.microsoft.graph.models.DriveItem;
 import com.microsoft.graph.models.DriveItemUploadableProperties;
 import com.microsoft.graph.models.UploadSession;
-import com.microsoft.graph.serviceclient.GraphServiceClient;
+
+import com.microsoft.graph.authentication.TokenCredentialAuthProvider;
+
+
+
+
+
+
 
 /**
  * Demonstrate using the Graph SDK high level API for PDF Conversion.
@@ -75,108 +81,109 @@ public class PdfConverterLarge  extends AbstractOpenXmlToPDF {
 
 
 	private static final Logger log = LoggerFactory.getLogger(PdfConverterLarge.class);
-			
+
 
 	public byte[] convert(InputStream fileStream, long streamSize, String ext) throws ConversionException, IOException {
-		// TODO: Pending fix, com.microsoft.kiota.ApiException: generalException
-		// https://github.com/microsoftgraph/msgraph-sdk-java/issues/1806
-
-		// The client credentials flow requires that you request the
-		// /.default scope, and pre-configure your permissions on the
-		// app registration in Azure. An administrator must grant consent
-		// to those permissions beforehand.
-		final String[] scopes = new String[] { "https://graph.microsoft.com/.default" };
-
 		// Authentication provider - Client credentials provider - Using a client secret
 		// https://learn.microsoft.com/en-us/graph/sdks/choose-authentication-providers?tabs=java
-		final ClientSecretCredential credential = new ClientSecretCredentialBuilder()
+		final ClientSecretCredential clientCreds = new ClientSecretCredentialBuilder()
 				.clientId(authConfig.apiKey())
-				.tenantId(authConfig.tenant())
 				.clientSecret(authConfig.apiSecret())
+				.tenantId(authConfig.tenant())
 				.build();
 
-		final GraphServiceClient graphClient = new GraphServiceClient(credential, scopes);
-		
-		
+		final TokenCredentialAuthProvider authProvider = new TokenCredentialAuthProvider(clientCreds);
+
+		final GraphServiceClient graphClient = GraphServiceClient
+				.builder()
+				.authenticationProvider(authProvider)
+				.buildClient();
+
 		String tmpFileName = UUID.randomUUID().toString() + ext;
-		String itemPath =  "root:/" + tmpFileName +":";
 
-		// Set body of the upload session request
-		CreateUploadSessionPostRequestBody uploadSessionRequest = new CreateUploadSessionPostRequestBody();
-		DriveItemUploadableProperties properties = new DriveItemUploadableProperties();
-		properties.getAdditionalData().put("@microsoft.graph.conflictBehavior", "replace");
-		uploadSessionRequest.setItem(properties);
-
-		// Support more than 4MB, using large file uploader; see https://docs.microsoft.com/en-us/graph/sdks/large-file-upload?tabs=java
-		String driveId = graphClient.sites().bySiteId(authConfig.site()).drive().get().getId();
-		UploadSession uploadSession = graphClient.drives()
-				.byDriveId(driveId)
-				.items()
-				.byDriveItemId(itemPath)
-				.createUploadSession()
-				.post(uploadSessionRequest);
-
-		// Create the upload task
-		int maxSliceSize = 10 * 320 * 1024;
-		LargeFileUploadTask<DriveItem> largeFileUploadTask = null;
 		try {
-			largeFileUploadTask = new LargeFileUploadTask<>(
-					graphClient.getRequestAdapter(),
+			DriveItemUploadableProperties properties = new DriveItemUploadableProperties();
+			JsonPrimitive conflictBehavior = new JsonPrimitive("replace");
+			properties.additionalDataManager().put("@microsoft.graph.conflictBehavior", conflictBehavior);
+
+			final DriveItemCreateUploadSessionParameterSet uploadParams = DriveItemCreateUploadSessionParameterSet
+					.newBuilder()
+					.withItem(new DriveItemUploadableProperties())
+					.build();
+			final DriveItemCreateUploadSessionRequest uploadSessionRequest = graphClient
+					.sites()
+					.byId(authConfig.site())
+					.drive()
+					.items()
+					.byId("root")
+					.itemWithPath(tmpFileName)
+					.createUploadSession(uploadParams)
+					.buildRequest();
+
+			log.info("uploadFile: uploading file to SharePoint DMS with request url : {}", uploadSessionRequest.getRequestUrl());
+
+			final UploadSession uploadSession = uploadSessionRequest.post();
+			if (uploadSession == null) {
+				throw new ConversionException("uploadFile: failed to upload file to SharePoint DMS : nullable upload file session");
+			}
+
+			int maxSliceSize = 10 * 320 * 1024;
+
+			final LargeFileUploadTask<DriveItem> fileUploadTask = new LargeFileUploadTask<>(
 					uploadSession,
+					graphClient,
 					fileStream,
 					streamSize,
-					maxSliceSize,
-					DriveItem::createFromDiscriminatorValue);
-		} catch (IllegalAccessException e) {
-			throw new ConversionException(e.getMessage(), e);
-		} catch (InvocationTargetException e) {
-			throw new ConversionException(e.getMessage(), e);
-		} catch (NoSuchMethodException e) {
-			throw new ConversionException(e.getMessage(), e);
-		}
+					DriveItem.class
+			);
+			final IProgressCallback progressCallback = (current, max) -> log.info("uploadFile: uploaded {} bytes of {} total bytes", current, max);
 
-		int maxAttempts = 5;
-		// Create a callback used by the upload provider
-		IProgressCallback callbackVerbose = (current, max) -> log.debug(
-				String.format("Uploaded %d bytes of %d total bytes", current, max));
+			final LargeFileUploadResult<DriveItem> uploadFileResult = fileUploadTask.upload(0, null, progressCallback);
 
-		// Do the upload
-		try {
-			UploadResult<DriveItem> uploadResult = largeFileUploadTask.upload(maxAttempts, callbackVerbose);
-			if (uploadResult.isUploadSuccessful()) {
-				log.debug(
-						String.format("Uploaded file with ID: %s", uploadResult.itemResponse.getId())
-				);
+			log.info("uploadFile: uploaded '{}' file to SharePoint DMS", uploadFileResult.location);
 
-				// Download as pdf
-				InputStream inputStream = graphClient.drives().byDriveId(driveId).items().byDriveItemId(itemPath).content().get(requestConfiguration -> {
-					requestConfiguration.queryParameters.format = "pdf";
-				});
+			log.info("upload: file was successfully uploaded to SharePoint");
 
+			// Download as pdf
+			String customPdfUrlStr = "/sites/" + authConfig.site() + "/drive/items/root:" + tmpFileName + ":" + "/content?format=pdf";
+			BufferedInputStream inputStream = (BufferedInputStream)graphClient.customRequest(customPdfUrlStr, Stream.class)
+					.buildRequest()
+					.get();
 
-				try {
-					// Move to trash
-					graphClient.drives().byDriveId(driveId).items().byDriveItemId(itemPath).delete();
-					return IOUtils.toByteArray(inputStream);
-				} catch (Exception e) {
-					throw new ConversionException(e.getMessage(), e);
-				}
+			// Method 2
+			DriveItemContentStreamRequestBuilder pdfRequestBuilder = graphClient
+					.sites()
+					.byId(authConfig.site())
+					.drive()
+					.items()
+					.byId("root")
+					.itemWithPath(tmpFileName)
+					.content();
 
-			} else {
-				log.debug(
-					String.format("Failed uploading file.")
-				);
+			String pdfUrlStr = pdfRequestBuilder
+					.buildRequest()
+					.getRequestUrl()
+					.toString() + "?format=pdf";
+
+			log.debug("compare:");
+			log.debug("compare:");
+			log.debug(pdfUrlStr);
+			URL pdfUrl = new URL(pdfUrlStr);
+
+			try {
+				// Move to trash
+				graphClient.sites(authConfig.site()).drive().items("root:" + tmpFileName + ":")
+						.buildRequest().delete();
+
+				return IOUtils.toByteArray(inputStream);
+			} catch (Exception e) {
+				throw new ConversionException(e.getMessage(), e);
 			}
-		} catch (CancellationException e) {
-			log.debug("Error uploading: " + e.getMessage());
-			throw new ConversionException(e.getMessage(), e);
-		} catch (InterruptedException e) {
+
+		} catch (Exception e) {
 			throw new ConversionException(e.getMessage(), e);
 		}
-
-		return  null;
-	}	
-	
+	}
 
 	@Override
 	public byte[] convert(byte[] docx, String ext) throws ConversionException {
