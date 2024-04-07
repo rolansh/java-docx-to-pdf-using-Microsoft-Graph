@@ -165,9 +165,8 @@ public class PdfConverterLarge  extends AbstractOpenXmlToPDF {
 					.getRequestUrl()
 					.toString() + "?format=pdf";
 
-			log.debug("compare:");
-			log.debug("compare:");
-			log.debug(pdfUrlStr);
+
+			// TODO: None of the above works, if we decide to go with 5.8 consider going using HttpRequest
 			URL pdfUrl = new URL(pdfUrlStr);
 
 			try {
